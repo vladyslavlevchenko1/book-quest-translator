@@ -6,6 +6,7 @@ import queue
 import shutil
 import threading
 import requests
+from deep_translator import GoogleTranslator
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import Tk, Label, Frame, Button, Text, Entry, END, LEFT, DISABLED, NORMAL, INSERT
 from tkinter import filedialog
@@ -19,7 +20,7 @@ STRING_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 class QuestTranslatorV4:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("Quest Translator v4.3+")
+        self.root.title("QuestTranslator v5.1 FIXED")
         self.root.geometry("920x700")
 
         self.folder = ""
@@ -29,6 +30,8 @@ class QuestTranslatorV4:
         self.cache_lock = threading.Lock()
         self.deepl_lock = threading.Lock()
         self.last_request_ts = 0.0
+        self.fallback_count = 0
+        self.cache_hits = 0
 
         self.cache = self.load_json(CACHE_FILE)
         self.file_state = self.load_json(STATE_FILE)
@@ -38,7 +41,7 @@ class QuestTranslatorV4:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self):
-        Label(self.root, text="Quest Translator v4", font=("Arial", 13, "bold")).pack(pady=10)
+        Label(self.root, text="QuestTranslator v5.1 FIXED", font=("Arial", 13, "bold")).pack(pady=10)
 
         self.label = Label(self.root, text="Папка не выбрана", fg="red")
         self.label.pack()
@@ -65,8 +68,8 @@ class QuestTranslatorV4:
     def paste_text(self, _event):
         try:
             self.api_entry.insert(INSERT, self.root.clipboard_get())
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"[ERROR] {e}")
         return "break"
 
     def log(self, text: str):
@@ -134,7 +137,6 @@ class QuestTranslatorV4:
         self.log(f"[SCAN] Старт: файлов найдено {len(files)}")
         unique = []
         seen = set()
-        contents = {}
 
         for i, path in enumerate(files, 1):
             if self.stop_requested:
@@ -147,7 +149,6 @@ class QuestTranslatorV4:
 
                 with open(path, "r", encoding="utf-8") as f:
                     text = f.read()
-                contents[path] = text
 
                 for m in STRING_PATTERN.finditer(text):
                     if not self.is_translatable(text, m):
@@ -155,7 +156,9 @@ class QuestTranslatorV4:
                     value = m.group(1)
                     with self.cache_lock:
                         cached = value in self.cache
-                    if not cached and value not in seen:
+                    if cached:
+                        self.cache_hits += 1
+                    elif value not in seen:
                         seen.add(value)
                         unique.append(value)
 
@@ -165,7 +168,8 @@ class QuestTranslatorV4:
                 self.log(f"[SCAN] ⚠️ Ошибка {os.path.basename(path)}: {e}")
 
         self.log(f"[SCAN] Уникальных строк: {len(unique)}")
-        return unique, contents
+        self.log(f"[SCAN] Строк из кэша: {self.cache_hits}")
+        return unique
 
     def request_deepl_batch(self, batch):
         key = self.api_entry.get().strip()
@@ -177,8 +181,6 @@ class QuestTranslatorV4:
         backoff = [1, 2, 4]
 
         for attempt in range(3):
-            if self.stop_requested:
-                return None
             try:
                 with self.deepl_lock:
                     delta = time.time() - self.last_request_ts
@@ -189,9 +191,9 @@ class QuestTranslatorV4:
                     response = requests.post(url, data=payload, timeout=30)
                     self.last_request_ts = time.time()
 
-                if response.status_code == 403:
-                    self.log(f"[TRANSLATE] ❌ 403 — пропущено {len(batch)} строк")
-                    return None
+                if response.status_code in (403, 429):
+                    self.log(f"[TRANSLATE] ❌ {response.status_code} — пропущено {len(batch)} строк (DeepL)")
+                    break
 
                 response.raise_for_status()
                 data = response.json()
@@ -208,7 +210,20 @@ class QuestTranslatorV4:
                 if attempt < 2:
                     time.sleep(backoff[attempt])
 
-        return None
+        # Fallback to GoogleTranslator
+        try:
+            translated = GoogleTranslator(source="auto", target="ru").translate_batch(batch)
+            if translated is None:
+                translated = []
+            if len(translated) != len(batch):
+                self.log("[TRANSLATE] ⚠️ mismatch batch size")
+                return None
+            self.fallback_count += len(batch)
+            self.log(f"[TRANSLATE] ℹ fallback Google: {len(batch)} строк")
+            return translated
+        except Exception as e:
+            self.log(f"[ERROR] fallback failed: {e}")
+            return None
 
     def translate_stage(self, unique_strings):
         self.log("[TRANSLATE] Старт этапа")
@@ -254,15 +269,13 @@ class QuestTranslatorV4:
 
         return STRING_PATTERN.sub(repl, original_text)
 
-    def write_stage(self, files, preloaded):
+    def write_stage(self, files):
         self.log("[WRITE] Старт этапа")
         total = len(files)
         for idx, path in enumerate(files, 1):
             try:
-                old_text = preloaded.get(path)
-                if old_text is None:
-                    with open(path, "r", encoding="utf-8") as f:
-                        old_text = f.read()
+                with open(path, "r", encoding="utf-8") as f:
+                    old_text = f.read()
 
                 backup = path + ".bak"
                 if not os.path.exists(backup):
@@ -286,7 +299,7 @@ class QuestTranslatorV4:
     def pipeline(self):
         self.running = True
         self.stop_requested = False
-        self.start_btn.config(state=DISABLED)
+        self.root.after(0, lambda: self.start_btn.config(state=DISABLED))
 
         try:
             files = self.collect_files()
@@ -294,17 +307,17 @@ class QuestTranslatorV4:
                 self.log("[SCAN] Нет .json/.snbt файлов")
                 return
 
-            unique, preloaded = self.pre_scan(files)
+            unique = self.pre_scan(files)
             if unique:
                 self.translate_stage(unique)
 
-            self.write_stage(files, preloaded)
+            self.write_stage(files)
             self.log("[DONE] Готово")
         except Exception as e:
             self.log(f"[FATAL] {e}")
         finally:
             self.running = False
-            self.start_btn.config(state=NORMAL)
+            self.root.after(0, lambda: self.start_btn.config(state=NORMAL))
 
     def start_process(self):
         if self.running or not self.folder:
