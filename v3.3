@@ -2,68 +2,75 @@ import os
 import re
 import json
 import time
-import threading
 import queue
+import shutil
+import threading
 import requests
-from tkinter import *
-from tkinter import filedialog, messagebox
-from deep_translator import GoogleTranslator
+from concurrent.futures import ThreadPoolExecutor
+from tkinter import Tk, Label, Frame, Button, Text, Entry, END, LEFT, DISABLED, NORMAL, INSERT
+from tkinter import filedialog
 
-# --- Константы ---
 CACHE_FILE = "translation_cache.json"
 STATE_FILE = "translation_state.json"
 MESSAGE_QUEUE = queue.Queue()
+STRING_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
 
-class UniversalQuestTranslator:
-    def __init__(self, root):
+
+class QuestTranslatorV4:
+    def __init__(self, root: Tk):
         self.root = root
-        self.root.title("MC Quest Translator v3.3 - Ultimate")
-        self.root.geometry("750x650")
+        self.root.title("Quest Translator v4.3+")
+        self.root.geometry("920x700")
+
+        self.folder = ""
+        self.running = False
+        self.stop_requested = False
+
+        self.cache_lock = threading.Lock()
+        self.deepl_lock = threading.Lock()
+        self.last_request_ts = 0.0
 
         self.cache = self.load_json(CACHE_FILE)
         self.file_state = self.load_json(STATE_FILE)
-        self.folder = ""
-        self.running = False
-        self.translator_choice = StringVar(value="Google")
 
         self.build_ui()
         self.update_log_loop()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self):
-        Label(self.root, text="Универсальный переводчик (v3.3 - Stable)", font=("Arial", 12, "bold")).pack(pady=10)
-        
+        Label(self.root, text="Quest Translator v4", font=("Arial", 13, "bold")).pack(pady=10)
+
         self.label = Label(self.root, text="Папка не выбрана", fg="red")
         self.label.pack()
 
-        btn_frame = Frame(self.root)
-        btn_frame.pack(pady=5)
-        Button(btn_frame, text="📁 Выбрать папку", command=self.choose_folder).pack(side=LEFT, padx=5)
-        OptionMenu(btn_frame, self.translator_choice, "Google", "DeepL").pack(side=LEFT, padx=5)
+        panel = Frame(self.root)
+        panel.pack(pady=8)
+        Button(panel, text="📁 Выбрать папку", command=self.choose_folder).pack(side=LEFT, padx=6)
 
         Label(self.root, text="DeepL API Key:").pack()
-        self.api_entry = Entry(self.root, width=50)
+        self.api_entry = Entry(self.root, width=72)
         self.api_entry.pack(pady=5)
         self.api_entry.bind("<Control-v>", self.paste_text)
 
-        ctrl_frame = Frame(self.root)
-        ctrl_frame.pack(pady=10)
-        self.start_btn = Button(ctrl_frame, text="🚀 Начать", command=self.start_process, bg="#d4edda", width=15)
-        self.start_btn.pack(side=LEFT, padx=5)
-        self.stop_btn = Button(ctrl_frame, text="⏹ Стоп", command=self.stop_process, bg="#f8d7da", width=15)
-        self.stop_btn.pack(side=LEFT, padx=5)
+        controls = Frame(self.root)
+        controls.pack(pady=10)
+        self.start_btn = Button(controls, text="🚀 Старт", command=self.start_process, width=16, bg="#d4edda")
+        self.start_btn.pack(side=LEFT, padx=6)
+        self.stop_btn = Button(controls, text="⏹ Стоп", command=self.stop_process, width=16, bg="#f8d7da")
+        self.stop_btn.pack(side=LEFT, padx=6)
 
-        self.log_widget = Text(self.root, wrap="word", height=18)
+        self.log_widget = Text(self.root, wrap="word", height=27)
         self.log_widget.pack(expand=True, fill="both", padx=10, pady=10)
 
-    def paste_text(self, event):
+    def paste_text(self, _event):
         try:
             self.api_entry.insert(INSERT, self.root.clipboard_get())
-        except: pass
+        except Exception:
+            pass
         return "break"
 
-    def log(self, msg):
-        MESSAGE_QUEUE.put(msg)
+    def log(self, text: str):
+        MESSAGE_QUEUE.put(text)
 
     def update_log_loop(self):
         while not MESSAGE_QUEUE.empty():
@@ -72,156 +79,250 @@ class UniversalQuestTranslator:
             self.log_widget.see(END)
         self.root.after(100, self.update_log_loop)
 
-    def load_json(self, path):
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except: return {}
-        return {}
+    @staticmethod
+    def load_json(path: str):
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
-    def save_json(self, path, data):
-        """Атомарное сохранение с защитой от блокировок Windows"""
+    @staticmethod
+    def atomic_save_json(path: str, data: dict):
         tmp = path + ".tmp"
-        for _ in range(5):
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                if os.path.exists(path):
-                    os.remove(path)
-                os.rename(tmp, path)
-                return
-            except PermissionError:
-                time.sleep(0.5)
-            except Exception as e:
-                self.log(f"⚠️ Ошибка записи {path}: {e}")
-                break
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def get_signature(path: str):
+        st = os.stat(path)
+        return f"{st.st_mtime_ns}_{st.st_size}"
+
+    @staticmethod
+    def pick_deepl_url(auth_key: str):
+        return "https://api-free.deepl.com/v2/translate" if auth_key.endswith(":fx") else "https://api.deepl.com/v2/translate"
 
     def choose_folder(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.folder = path
+        picked = filedialog.askdirectory()
+        if picked:
+            self.folder = picked
             self.label.config(text=f"Папка: {self.folder}", fg="green")
 
-    def translate_batch(self, batch):
-        """Улучшенная логика запросов к API"""
-        for attempt in range(3):
-            if not self.running: return None
+    def collect_files(self):
+        files = []
+        for root_dir, _, names in os.walk(self.folder):
+            for name in names:
+                if name.endswith((".json", ".snbt")):
+                    files.append(os.path.join(root_dir, name))
+        return files
+
+    def is_translatable(self, content: str, match):
+        raw = match.group(1)
+        tail = content[match.end():match.end() + 1]
+        if tail == ":":  # key in "key": value
+            return False
+        if len(raw.strip()) <= 1:
+            return False
+        if raw.isdigit():
+            return False
+        return True
+
+    def pre_scan(self, files):
+        self.log(f"[SCAN] Старт: файлов найдено {len(files)}")
+        unique = []
+        seen = set()
+        contents = {}
+
+        for i, path in enumerate(files, 1):
+            if self.stop_requested:
+                self.log("[SCAN] Остановлено пользователем")
+                break
             try:
-                if self.translator_choice.get() == "Google":
-                    return GoogleTranslator(source='en', target='ru').translate_batch(batch)
-                else:
-                    key = self.api_entry.get().strip()
-                    # Точное определение эндпоинта
-                    url = "https://api-free.deepl.com/v2/translate" if key.endswith(":fx") else "https://api.deepl.com/v2/translate"
-                    
-                    # Стабильный формат данных для DeepL[cite: 2]
-                    payload = {
-                        "auth_key": key,
-                        "target_lang": "RU",
-                        "text": batch
-                    }
-                    r = requests.post(url, data=payload, timeout=15)
-                    
-                    if r.status_code == 403:
-                        self.log("❌ 403 Forbidden: Проверь ключ или VPN (нужна Европа)!")
-                        return None
-                    
-                    r.raise_for_status()
-                    return [x["text"] for x in r.json()["translations"]]
+                sig = self.get_signature(path)
+                if self.file_state.get(path) == sig:
+                    continue
+
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                contents[path] = text
+
+                for m in STRING_PATTERN.finditer(text):
+                    if not self.is_translatable(text, m):
+                        continue
+                    value = m.group(1)
+                    with self.cache_lock:
+                        cached = value in self.cache
+                    if not cached and value not in seen:
+                        seen.add(value)
+                        unique.append(value)
+
+                if i % 100 == 0 or i == len(files):
+                    self.log(f"[SCAN] Прогресс: {i}/{len(files)}")
             except Exception as e:
-                self.log(f"⚠️ Попытка {attempt+1}: {e}")
-                time.sleep(1)
+                self.log(f"[SCAN] ⚠️ Ошибка {os.path.basename(path)}: {e}")
+
+        self.log(f"[SCAN] Уникальных строк: {len(unique)}")
+        return unique, contents
+
+    def request_deepl_batch(self, batch):
+        key = self.api_entry.get().strip()
+        if not key:
+            raise RuntimeError("DeepL API key пуст")
+
+        url = self.pick_deepl_url(key)
+        payload = {"auth_key": key, "target_lang": "RU", "text": batch}
+        backoff = [1, 2, 4]
+
+        for attempt in range(3):
+            if self.stop_requested:
+                return None
+            try:
+                with self.deepl_lock:
+                    delta = time.time() - self.last_request_ts
+                    min_delay = 0.35
+                    if delta < min_delay:
+                        time.sleep(min_delay - delta)
+
+                    response = requests.post(url, data=payload, timeout=30)
+                    self.last_request_ts = time.time()
+
+                if response.status_code == 403:
+                    self.log(f"[TRANSLATE] ❌ 403 — пропущено {len(batch)} строк")
+                    return None
+
+                response.raise_for_status()
+                data = response.json()
+                translations = data.get("translations", [])
+                result = [item.get("text", "") for item in translations]
+
+                if len(result) != len(batch):
+                    self.log("[TRANSLATE] ⚠️ mismatch batch size")
+                    return None
+
+                return result
+            except Exception as e:
+                self.log(f"[TRANSLATE] ⚠️ Попытка {attempt + 1}/3: {e}")
+                if attempt < 2:
+                    time.sleep(backoff[attempt])
+
         return None
 
-    def worker(self):
-        self.running = True
-        self.start_btn.config(state=DISABLED)
-        
-        files = []
-        for r, _, f in os.walk(self.folder):
-            for file in f:
-                if file.endswith((".snbt", ".json")):
-                    files.append(os.path.join(r, file))
+    def translate_stage(self, unique_strings):
+        self.log("[TRANSLATE] Старт этапа")
+        batches = [unique_strings[i:i + 30] for i in range(0, len(unique_strings), 30)]
+        total = len(batches)
+        done = 0
 
-        self.log(f"🔎 Найдено файлов: {len(files)}")
+        # max_workers = 1 для максимальной стабильности и строгого контроля rate limit
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for batch in batches:
+                if self.stop_requested:
+                    self.log("[TRANSLATE] Остановлено пользователем: новые запросы не отправляются")
+                    break
 
-        for i, path in enumerate(files):
-            if not self.running: break
-            
-            f_stat = os.stat(path)
-            sig = f"{f_stat.st_mtime_ns}_{f_stat.st_size}"
-            if self.file_state.get(path) == sig:
-                continue
+                future = executor.submit(self.request_deepl_batch, batch)
+                result = future.result()
+                done += 1
 
+                if result is not None:
+                    with self.cache_lock:
+                        for src, dst in zip(batch, result):
+                            self.cache[src] = dst
+                        if done % 5 == 0:
+                            self.atomic_save_json(CACHE_FILE, self.cache)
+                else:
+                    self.log(f"[TRANSLATE] ⚠️ Батч {done}/{total} без результата")
+
+                self.log(f"[TRANSLATE] Прогресс батчей: {done}/{total}")
+
+        with self.cache_lock:
+            self.atomic_save_json(CACHE_FILE, self.cache)
+        self.log("[TRANSLATE] Этап завершен")
+
+    def apply_translations(self, original_text: str):
+        def repl(match):
+            source = match.group(1)
+            tail = original_text[match.end():match.end() + 1]
+            if tail == ":":
+                return f'"{source}"'
+            with self.cache_lock:
+                translated = self.cache.get(source, source)
+            return '"' + translated.replace('"', '\\"') + '"'
+
+        return STRING_PATTERN.sub(repl, original_text)
+
+    def write_stage(self, files, preloaded):
+        self.log("[WRITE] Старт этапа")
+        total = len(files)
+        for idx, path in enumerate(files, 1):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                old_text = preloaded.get(path)
+                if old_text is None:
+                    with open(path, "r", encoding="utf-8") as f:
+                        old_text = f.read()
 
-                if not os.path.exists(path + ".bak"):
-                    with open(path + ".bak", "w", encoding="utf-8") as f: f.write(content)
+                backup = path + ".bak"
+                if not os.path.exists(backup):
+                    shutil.copy2(path, backup)
 
-                # Сохраняем порядок уникальных строк
-                matches = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', content)
-                todo = []
-                seen = set()
-                for m in matches:
-                    if len(m.strip()) > 1 and not m.isdigit() and ":" not in m:
-                        if m not in self.cache and m not in seen:
-                            todo.append(m)
-                            seen.add(m)
-
-                if todo:
-                    for j in range(0, len(todo), 20):
-                        if not self.running: break
-                        batch = todo[j:j+20]
-                        res = self.translate_batch(batch)
-                        if res:
-                            for o, t in zip(batch, res): self.cache[o] = t
-                        else:
-                            # Если API упал, прекращаем файл, чтобы не портить кэш
-                            raise RuntimeError("API недоступен")
-                        time.sleep(0.4)
-
-                def repl(m):
-                    orig = m.group(1)
-                    if content[m.end():m.end()+1] == ":": return f'"{orig}"'
-                    trans = self.cache.get(orig, orig)
-                    return f'"{trans.replace('"', '\\"')}"'
-
-                new_content = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', repl, content)
-                
+                new_text = self.apply_translations(old_text)
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                
-                self.file_state[path] = sig
-                if (i + 1) % 10 == 0:
-                    self.save_json(CACHE_FILE, self.cache)
-                    self.save_json(STATE_FILE, self.file_state)
-                    self.log(f"✅ Готово: {i+1}/{len(files)}")
+                    f.write(new_text)
 
+                self.file_state[path] = self.get_signature(path)
+
+                if idx % 100 == 0 or idx == total:
+                    self.atomic_save_json(STATE_FILE, self.file_state)
+                    self.log(f"[WRITE] Прогресс: {idx}/{total}")
             except Exception as e:
-                self.log(f"❌ Проблема в {os.path.basename(path)}: {e}")
+                self.log(f"[WRITE] ⚠️ Ошибка {os.path.basename(path)}: {e}")
 
-        self.save_json(CACHE_FILE, self.cache)
-        self.save_json(STATE_FILE, self.file_state)
-        self.log("🏁 ПРОЦЕСС ЗАВЕРШЕН")
-        self.running = False
-        self.start_btn.config(state=NORMAL)
+        self.atomic_save_json(STATE_FILE, self.file_state)
+        self.log("[WRITE] Этап завершен")
+
+    def pipeline(self):
+        self.running = True
+        self.stop_requested = False
+        self.start_btn.config(state=DISABLED)
+
+        try:
+            files = self.collect_files()
+            if not files:
+                self.log("[SCAN] Нет .json/.snbt файлов")
+                return
+
+            unique, preloaded = self.pre_scan(files)
+            if unique:
+                self.translate_stage(unique)
+
+            self.write_stage(files, preloaded)
+            self.log("[DONE] Готово")
+        except Exception as e:
+            self.log(f"[FATAL] {e}")
+        finally:
+            self.running = False
+            self.start_btn.config(state=NORMAL)
 
     def start_process(self):
-        if not self.folder: return
-        threading.Thread(target=self.worker, daemon=True).start()
+        if self.running or not self.folder:
+            return
+        threading.Thread(target=self.pipeline, daemon=True).start()
 
     def stop_process(self):
-        self.running = False
+        self.stop_requested = True
+        self.log("[CONTROL] Стоп: новые запросы остановлены")
 
     def on_close(self):
-        self.save_json(CACHE_FILE, self.cache)
-        self.save_json(STATE_FILE, self.file_state)
+        with self.cache_lock:
+            self.atomic_save_json(CACHE_FILE, self.cache)
+        self.atomic_save_json(STATE_FILE, self.file_state)
         self.root.destroy()
+
 
 if __name__ == "__main__":
     root = Tk()
-    UniversalQuestTranslator(root)
+    QuestTranslatorV4(root)
     root.mainloop()
