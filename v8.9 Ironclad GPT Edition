@@ -43,11 +43,16 @@ PLACEHOLDER_PATTERN = re.compile(r"(%\d*\$?[sd]|\{\d+\}|\$\{[^}]+\})")
 def safe_unescape(text):
     if not isinstance(text, str):
         return ""
+    try:
+        return json.loads(f'"{text}"')
+    except Exception:
+        pass
+    # Conservative fallback: decode only common safe escapes, preserve the rest.
     s = text
-    s = s.replace('\\\\', '\\')
     s = s.replace('\\"', '"')
     s = s.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
     s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    s = s.replace('\\\\', '\\')
     return s
 
 
@@ -119,7 +124,10 @@ class QuestTranslatorEngine:
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root_destroyed = False
-        self.root.after(100, self.update_ui_loop)
+        try:
+            self.root.after(100, self.update_ui_loop)
+        except tk.TclError:
+            return
 
     def setup_network(self):
         self.session = requests.Session()
@@ -196,11 +204,14 @@ class QuestTranslatorEngine:
             if self.log_queue.empty(): break
             logs.append(self.log_queue.get_nowait())
         if logs:
-            self.log_widget.insert(tk.END, "\n".join(logs) + "\n")
-            cur_lines = int(self.log_widget.index("end-1c").split('.')[0])
-            if cur_lines > MAX_VISIBLE_LOG_LINES:
-                self.log_widget.delete("1.0", f"{cur_lines - MAX_VISIBLE_LOG_LINES}.0")
-            self.log_widget.see(tk.END)
+            try:
+                self.log_widget.insert(tk.END, "\n".join(logs) + "\n")
+                cur_lines = int(self.log_widget.index("end-1c").split('.')[0])
+                if cur_lines > MAX_VISIBLE_LOG_LINES:
+                    self.log_widget.delete("1.0", f"{cur_lines - MAX_VISIBLE_LOG_LINES}.0")
+                self.log_widget.see(tk.END)
+            except tk.TclError:
+                return
         latest_stats = latest_prog = None
         while not self.ui_queue.empty():
             msg = self.ui_queue.get_nowait()
@@ -212,7 +223,10 @@ class QuestTranslatorEngine:
             self.stat_label.config(text=f"DeepL {latest_stats['deepl']} Google {latest_stats['google']} GPT {latest_stats['gpt']} Cache {latest_stats['cache_hits']} Errors {latest_stats['failed']} Cost ${latest_stats['cost']:.4f}")
         if latest_prog is not None: self.progress.config(value=latest_prog)
         self.root_destroyed = False
-        self.root.after(100, self.update_ui_loop)
+        try:
+            self.root.after(100, self.update_ui_loop)
+        except tk.TclError:
+            return
 
     def update_stats(self, k, v):
         with self.stat_lock:
@@ -253,13 +267,14 @@ class QuestTranslatorEngine:
         return False
 
     def atomic_save_json(self, path, data, lock):
+        # Atomic save for test-mode crash/power-loss safety.
         with lock:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=TMP_SUFFIX, dir=os.path.dirname(path) or ".")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(data, f, ensure_ascii=False, separators=(",", ":")); f.flush(); os.fsync(f.fileno())
-                if os.path.exists(path): self._retry_copy2(path, f"{path}.bak")
+                if os.path.exists(path): self._retry_copy2(path, f"{path}.bak")  # Backup for rollback safety.
                 if not self._retry_replace(tmp, path): raise OSError("replace failed")
             finally:
                 if os.path.exists(tmp):
@@ -339,7 +354,6 @@ class QuestTranslatorEngine:
         return True
 
     def make_smart_batches(self, strings):
-        d=g=q=[]
         deepl_b=[]; google_b=[]; gpt_b=[]
         cd=[]; cg=[]; cq=[]; dl=gl=ql=0
         for s in strings:
@@ -383,7 +397,7 @@ class QuestTranslatorEngine:
             self.logger.warning("GPT split depth exceeded")
             return [None]*len(batch)
         h=hashlib.md5(json.dumps(batch,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
-        if h in self.gpt_request_history:
+        if h in self.gpt_request_history:  # GPT poison batch protection.
             self.logger.warning("GPT batch skipped from history")
             return [None]*len(batch)
         if self.gpt_circuit_breaker_until > time.time():
@@ -525,7 +539,7 @@ class QuestTranslatorEngine:
             if not content: continue
             nl=self._detect_newline_style(content)
             def repl(m):
-                if self._is_json_key(m, content):
+                if self._is_json_key(m, content):  # JSON key protection.
                     return m.group(0)
                 raw=m.group(1); original=self.normalize_text(safe_unescape(raw))
                 with self.cache_lock: tr=self.cache.get(original)
@@ -546,7 +560,15 @@ class QuestTranslatorEngine:
                     nsz=os.path.getsize(path); osz=max(1,len(content.encode(enc or 'utf-8',errors='ignore')))
                     if nsz>0 and nsz>=osz*0.1: ok=True
                 except Exception: ok=False
-                if not ok and os.path.exists(bak): self._retry_replace(bak,path)
+                if ok:
+                    try:
+                        with open(path, "r", encoding=enc or "utf-8", errors="strict") as vf:
+                            vcontent = vf.read()
+                        if not STRING_PATTERN.search(vcontent):
+                            ok = False
+                    except Exception:
+                        ok = False
+                if not ok and os.path.exists(bak): self._retry_replace(bak,path)  # Rollback on validation failure.
                 with self.state_lock: self.file_state[path]=self.get_signature(path)
             finally:
                 if os.path.exists(tmp):
@@ -617,6 +639,7 @@ class QuestTranslatorEngine:
         if ftp and not self.stop_event.is_set(): self.write_stage(ftp)
         with self.save_lock:
             self.compact_cache(force=False); self.atomic_save_json(CACHE_FILE,self.cache,self.cache_lock); self.atomic_save_json(STATE_FILE,self.file_state,self.state_lock); self.export_metrics()
+        self.gpt_request_history.clear()
         self.logger.info("Pipeline finished"); self.is_running=False
         try: self.ui_queue.put_nowait(("reset_controls",None))
         except queue.Full: pass
