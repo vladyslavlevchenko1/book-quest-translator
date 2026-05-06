@@ -118,6 +118,7 @@ class QuestTranslatorEngine:
         self.google_translators = {}
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root_destroyed = False
         self.root.after(100, self.update_ui_loop)
 
     def setup_network(self):
@@ -178,7 +179,18 @@ class QuestTranslatorEngine:
         self.pause_btn.config(text="ПРОДОЛЖИТЬ" if self.pause_requested else "ПАУЗА")
     def stop_translation(self): self.stop_event.set(); self.logger.info("Stop requested")
 
+    def _is_json_key(self, match, full_text):
+        end_pos = match.end()
+        for i in range(end_pos, len(full_text)):
+            ch = full_text[i]
+            if ch.isspace():
+                continue
+            return ch == ":"
+        return False
+
     def update_ui_loop(self):
+        if self.root_destroyed:
+            return
         logs = []
         for _ in range(100):
             if self.log_queue.empty(): break
@@ -199,6 +211,7 @@ class QuestTranslatorEngine:
         if latest_stats:
             self.stat_label.config(text=f"DeepL {latest_stats['deepl']} Google {latest_stats['google']} GPT {latest_stats['gpt']} Cache {latest_stats['cache_hits']} Errors {latest_stats['failed']} Cost ${latest_stats['cost']:.4f}")
         if latest_prog is not None: self.progress.config(value=latest_prog)
+        self.root_destroyed = False
         self.root.after(100, self.update_ui_loop)
 
     def update_stats(self, k, v):
@@ -370,7 +383,9 @@ class QuestTranslatorEngine:
             self.logger.warning("GPT split depth exceeded")
             return [None]*len(batch)
         h=hashlib.md5(json.dumps(batch,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
-        if h in self.gpt_request_history: return [None]*len(batch)
+        if h in self.gpt_request_history:
+            self.logger.warning("GPT batch skipped from history")
+            return [None]*len(batch)
         if self.gpt_circuit_breaker_until > time.time():
             self.logger.warning("GPT cooldown active")
             return [None]*len(batch)
@@ -405,11 +420,14 @@ class QuestTranslatorEngine:
                 if self.gpt_consecutive_failures>=6:
                     self.gpt_circuit_breaker_until=time.time()+300
                     self.logger.error("GPT circuit breaker activation")
+                    self.gpt_request_history.add(h)
                     break
         if len(batch)>1:
             self.logger.warning(f"GPT split recursion depth={depth} reason=failure")
             mid=len(batch)//2
             return self.request_gpt_batch(batch[:mid],depth+1)+self.request_gpt_batch(batch[mid:],depth+1)
+        self.logger.error("GPT final failure for batch")
+        self.gpt_request_history.add(h)
         return [None]*len(batch)
 
     def request_deepl_batch(self, batch, depth=0):
@@ -507,6 +525,8 @@ class QuestTranslatorEngine:
             if not content: continue
             nl=self._detect_newline_style(content)
             def repl(m):
+                if self._is_json_key(m, content):
+                    return m.group(0)
                 raw=m.group(1); original=self.normalize_text(safe_unescape(raw))
                 with self.cache_lock: tr=self.cache.get(original)
                 if not tr: return m.group(0)
@@ -579,6 +599,8 @@ class QuestTranslatorEngine:
             ftp.append(p)
             for m in STRING_PATTERN.finditer(c):
                 if self.stop_event.is_set(): break
+                if self._is_json_key(m, c):
+                    continue
                 v=self.normalize_text(safe_unescape(m.group(1)))
                 if not self.is_translatable(v): continue
                 self.update_stats("total_strings",1)
@@ -612,9 +634,10 @@ class QuestTranslatorEngine:
 
     def on_close(self):
         self.logger.info("Shutdown initiated")
+        self.root_destroyed = True
         self.stop_event.set()
-        if self.pipeline_thread and self.pipeline_thread.is_alive(): self.pipeline_thread.join(timeout=3.0)
-        if self.auto_save_thread and self.auto_save_thread.is_alive(): self.auto_save_thread.join(timeout=3.0)
+        if self.pipeline_thread and self.pipeline_thread.is_alive(): self.pipeline_thread.join(timeout=10.0)
+        if self.auto_save_thread and self.auto_save_thread.is_alive(): self.auto_save_thread.join(timeout=10.0)
         with self.save_lock:
             self.compact_cache(force=False); self.atomic_save_json(CACHE_FILE,self.cache,self.cache_lock); self.atomic_save_json(STATE_FILE,self.file_state,self.state_lock); self.export_metrics()
         self.logger.info("Shutdown complete")
