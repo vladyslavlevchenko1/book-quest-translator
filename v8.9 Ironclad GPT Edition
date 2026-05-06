@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import hashlib
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -20,6 +21,7 @@ from urllib3.util.retry import Retry
 
 CACHE_FILE = "translation_cache.json"
 STATE_FILE = "translation_state.json"
+METRICS_FILE = "metrics.json"
 LOG_FILE = "translator.log"
 TMP_SUFFIX = ".tmp_translate"
 
@@ -58,10 +60,10 @@ class LoggerProxy:
 class QuestTranslatorEngine:
     def __init__(self, root):
         self.root = root
-        self.root.title("Quest Translator Engine v8.9 Ironclad")
-        self.root.geometry("800x650")
+        self.root.title("Quest Translator Engine v9.0 Ironclad")
+        self.root.geometry("900x700")
 
-        self.log_queue = queue.Queue(maxsize=2000)
+        self.log_queue = queue.Queue(maxsize=5000)
         self.ui_queue = queue.Queue(maxsize=5000)
 
         self.cache_lock = threading.Lock()
@@ -72,12 +74,21 @@ class QuestTranslatorEngine:
         self.stop_event = threading.Event()
         self.pause_requested = False
         self.is_running = False
+        self.autosave_in_progress = False
 
         self.cache = {}
         self.file_state = {}
         self.folder = ""
         self.gpt_client = None
         self.gpt_request_history = set()
+        self.pipeline_thread = None
+        self.auto_save_thread = None
+
+        self.pricing = {
+            "gpt-4o-mini": {"in": 0.15, "out": 0.60},
+            "gpt-4.1-mini": {"in": 0.40, "out": 1.60},
+            "gpt-4.1": {"in": 2.00, "out": 8.00},
+        }
 
         self.reset_runtime_state()
         self.setup_network()
@@ -85,6 +96,7 @@ class QuestTranslatorEngine:
 
         self.cache = self.load_json_safe(CACHE_FILE)
         self.file_state = self.load_json_safe(STATE_FILE)
+        self.compact_cache()
         self.google_translators = {}
 
         self.build_ui()
@@ -110,19 +122,27 @@ class QuestTranslatorEngine:
         self.gpt_consecutive_failures = 0
         self.gpt_circuit_breaker_until = 0.0
         self.last_percent = -1
-        self.last_cache_backup_ts = time.time()
-        self.backup_interval_sec = 3600
+        self.start_ts = 0.0
         with self.stat_lock:
-            self.stat_data = {"deepl": 0, "google": 0, "gpt": 0, "cache_hits": 0, "failed": 0, "cost": 0.0}
+            self.stat_data = {
+                "deepl": 0,
+                "google": 0,
+                "gpt": 0,
+                "cache_hits": 0,
+                "failed": 0,
+                "cost": 0.0,
+                "total_strings": 0,
+            }
 
     def build_ui(self):
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
+
         ctrl_frame = ttk.Frame(main_frame)
         ctrl_frame.pack(fill=tk.X, pady=5)
 
         ttk.Label(ctrl_frame, text="DeepL Key").pack(side=tk.LEFT)
-        self.api_entry = ttk.Entry(ctrl_frame, width=30)
+        self.api_entry = ttk.Entry(ctrl_frame, width=30, show="*")
         self.api_entry.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(ctrl_frame, text="Lang").pack(side=tk.LEFT)
@@ -142,136 +162,101 @@ class QuestTranslatorEngine:
         self.gpt_mode_combo.current(1)
         self.gpt_mode_combo.pack(side=tk.LEFT, padx=5)
 
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        self.start_btn = ttk.Button(btn_frame, text="СТАРТ", command=self.start_translation)
+        self.start_btn.pack(side=tk.LEFT, padx=4)
+        self.pause_btn = ttk.Button(btn_frame, text="ПАУЗА", command=self.toggle_pause, state=tk.DISABLED)
+        self.pause_btn.pack(side=tk.LEFT, padx=4)
+        self.stop_btn = ttk.Button(btn_frame, text="СТОП", command=self.stop_translation, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=4)
+
         self.stat_label = ttk.Label(main_frame, text="Статистика загружается...")
         self.stat_label.pack(anchor=tk.W)
         self.progress = ttk.Progressbar(main_frame, orient=tk.HORIZONTAL, mode="determinate")
         self.progress.pack(fill=tk.X, pady=5)
-        self.log_widget = tk.Text(main_frame, wrap=tk.WORD, height=15)
+
+        self.log_widget = tk.Text(main_frame, wrap=tk.WORD, height=20)
         self.log_widget.pack(fill=tk.BOTH, expand=True)
+
+    def normalize_text(self, s):
+        if not isinstance(s, str):
+            return ""
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r"\n+", "\n", s)
+        return s.strip()
 
     def select_folder(self):
         folder = filedialog.askdirectory()
         if folder:
             self.folder = folder
 
+    def toggle_pause(self):
+        self.pause_requested = not self.pause_requested
+        self.pause_btn.config(text="ПРОДОЛЖИТЬ" if self.pause_requested else "ПАУЗА")
+
+    def stop_translation(self):
+        self.stop_event.set()
+
     def update_ui_loop(self):
         logs = []
-        while not self.log_queue.empty():
+        max_logs_per_tick = 100
+        for _ in range(max_logs_per_tick):
+            if self.log_queue.empty():
+                break
             logs.append(self.log_queue.get_nowait())
         if logs:
             self.log_widget.insert(tk.END, "\n".join(logs) + "\n")
             self.log_widget.see(tk.END)
+
+        latest_stats = None
+        latest_prog = None
+        while not self.ui_queue.empty():
+            msg = self.ui_queue.get_nowait()
+            if msg[0] == "stats":
+                latest_stats = msg[1]
+            elif msg[0] == "progress":
+                latest_prog = msg[1]
+            elif msg[0] == "reset_controls":
+                self.start_btn.config(state=tk.NORMAL)
+                self.pause_btn.config(state=tk.DISABLED, text="ПАУЗА")
+                self.stop_btn.config(state=tk.DISABLED)
+
+        if latest_stats:
+            self.stat_label.config(text=(
+                f"DeepL {latest_stats['deepl']}  Google {latest_stats['google']}  GPT {latest_stats['gpt']}  "
+                f"Cache {latest_stats['cache_hits']}  Errors {latest_stats['failed']}  Cost ${latest_stats['cost']:.4f}"
+            ))
+        if latest_prog is not None:
+            self.progress.config(value=latest_prog)
+
         self.root.after(100, self.update_ui_loop)
 
     def update_stats(self, key, value):
         with self.stat_lock:
             self.stat_data[key] = self.stat_data.get(key, 0) + value
-
-    def make_smart_batches(self, strings):
-        deepl_b, google_b, gpt_b = [], [], []
-        curr_d, curr_g, curr_gpt = [], [], []
-        d_len = g_len = gpt_len = 0
-        for s in strings:
-            s_len = len(s)
-            if s_len <= 120:
-                if len(curr_d) >= 15 or d_len + s_len > self.deepl_max_chars:
-                    deepl_b.append(curr_d)
-                    curr_d, d_len = [], 0
-                curr_d.append(s); d_len += s_len
-            elif s_len <= 800:
-                if len(curr_g) >= 10 or g_len + s_len > 3000:
-                    google_b.append(curr_g)
-                    curr_g, g_len = [], 0
-                curr_g.append(s); g_len += s_len
-            else:
-                if len(curr_gpt) >= 5 or gpt_len + s_len > 8000:
-                    gpt_b.append(curr_gpt)
-                    curr_gpt, gpt_len = [], 0
-                curr_gpt.append(s); gpt_len += s_len
-        for c, out in ((curr_d, deepl_b), (curr_g, google_b), (curr_gpt, gpt_b)):
-            if c:
-                out.append(c)
-        return deepl_b, google_b, gpt_b
-
-    def safe_json_extract_v2(self, text):
-        if not text:
-            return []
+            snapshot = dict(self.stat_data)
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                try:
-                    data = json.loads(text[start:end + 1])
-                except json.JSONDecodeError:
-                    return []
-            else:
-                return []
-        vals = data.get("translations") if isinstance(data, dict) else None
-        return vals if isinstance(vals, list) else []
+            self.ui_queue.put_nowait(("stats", snapshot))
+        except queue.Full:
+            pass
 
-    def validate_translation(self, src, dst):
-        if not isinstance(dst, str) or not dst.strip():
-            return False
-        if len(dst) > max(len(src) * 5, len(src) + 400):
-            return False
-        if PLACEHOLDER_PATTERN.findall(src) != PLACEHOLDER_PATTERN.findall(dst):
-            return False
-        if FORMAT_CODE_PATTERN.findall(src) != FORMAT_CODE_PATTERN.findall(dst):
-            return False
-        return True
-
-    def request_gpt_batch(self, batch, depth=0):
-        if self.stop_event.is_set() or not self.gpt_client:
-            return [None] * len(batch)
-        batch_hash = hashlib.md5(json.dumps(batch, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-        if batch_hash in self.gpt_request_history:
-            return [None] * len(batch)
-        if self.gpt_circuit_breaker_until > time.time():
-            return [None] * len(batch)
-
-        model_name = {"Cheap": "gpt-4o-mini", "Balanced": "gpt-4.1-mini", "Quality": "gpt-4.1"}.get(self.gpt_mode_combo.get(), "gpt-4o-mini")
-        request_payload = json.dumps({"texts": batch}, ensure_ascii=False)
-        for attempt in range(3):
+    def update_progress_smart(self, current, total):
+        if total <= 0:
+            return
+        percent = int((current / total) * 100)
+        if percent != self.last_percent:
+            self.last_percent = percent
             try:
-                time.sleep(self.gpt_delay)
-                response = self.gpt_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": "Return JSON object with exactly one key: translations (array of same length and same order). No markdown."},
-                        {"role": "user", "content": request_payload},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                    timeout=45,
-                )
-                parsed = self.safe_json_extract_v2(response.choices[0].message.content)
-                if len(parsed) != len(batch):
-                    raise ValueError("Invalid GPT batch length")
-                out = [t if self.validate_translation(s, t) else None for s, t in zip(batch, parsed)]
-                if any(out):
-                    self.gpt_request_history.add(batch_hash)
-                usage = getattr(response, "usage", None)
-                if usage:
-                    self.update_stats("cost", ((usage.prompt_tokens / 1_000_000) * 0.15) + ((usage.completion_tokens / 1_000_000) * 0.6))
-                self.update_stats("gpt", sum(1 for x in out if x))
-                self.gpt_consecutive_failures = 0
-                self.gpt_delay = max(1.0, self.gpt_delay * 0.85)
-                return out
-            except Exception as e:
-                self.logger.warning(f"GPT attempt {attempt + 1} failed: {e}")
-                self.gpt_consecutive_failures += 1
-                self.gpt_delay = min(20.0, self.gpt_delay * 1.8)
-                if self.gpt_consecutive_failures >= 6:
-                    self.gpt_circuit_breaker_until = time.time() + 300
-                    break
-        return [None] * len(batch)
+                self.ui_queue.put_nowait(("progress", percent))
+            except queue.Full:
+                pass
 
     def load_json_safe(self, path):
-        if not os.path.exists(path):
-            return {}
         for candidate in [path, f"{path}.bak"]:
+            if not os.path.exists(candidate):
+                continue
             try:
                 with open(candidate, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -304,8 +289,539 @@ class QuestTranslatorEngine:
             except OSError:
                 pass
 
+    def compact_cache(self):
+        with self.cache_lock:
+            compacted = {}
+            for k, v in self.cache.items():
+                nk = self.normalize_text(k)
+                nv = self.normalize_text(v)
+                if not nk or not nv:
+                    continue
+                compacted[nk] = nv
+            self.cache = compacted
+
+    def get_signature(self, path):
+        st = os.stat(path)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+
+    def read_file_safe(self, path):
+        for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+            try:
+                with open(path, "r", encoding=enc, errors="strict") as f:
+                    return f.read(), enc
+            except Exception:
+                continue
+        return None, None
+
+    def is_translatable(self, value):
+        if not value:
+            return False
+        s = self.normalize_text(value)
+        if not s:
+            return False
+        if RESOURCE_ID_PATTERN.match(s):
+            return False
+        if s.startswith("/") or s.startswith("{") and s.endswith("}"):
+            return False
+        if re.fullmatch(r"[0-9_./:-]+", s):
+            return False
+        return any(c.isalpha() for c in s)
+
+    def has_hallucination_artifacts(self, text):
+        low = text.lower()
+        if "```" in text:
+            return True
+        patterns = ["\"translations\"", "translation:", "here is", "объяснение", "json:", "assistant:"]
+        return any(p in low for p in patterns)
+
+    def validate_translation(self, src, dst):
+        if not isinstance(dst, str):
+            return False
+        src_n = self.normalize_text(src)
+        dst_n = self.normalize_text(dst)
+        if not dst_n:
+            return False
+        if self.has_hallucination_artifacts(dst_n):
+            return False
+        if len(dst_n) > max(len(src_n) * 5, len(src_n) + 400):
+            return False
+        if Counter(PLACEHOLDER_PATTERN.findall(src_n)) != Counter(PLACEHOLDER_PATTERN.findall(dst_n)):
+            return False
+        if Counter(FORMAT_CODE_PATTERN.findall(src_n)) != Counter(FORMAT_CODE_PATTERN.findall(dst_n)):
+            return False
+        return True
+
+    def make_smart_batches(self, strings):
+        deepl_b, google_b, gpt_b = [], [], []
+        curr_d, curr_g, curr_gpt = [], [], []
+        d_len = g_len = gpt_len = 0
+        for s in strings:
+            s_len = len(s)
+            if s_len <= 120:
+                if len(curr_d) >= 15 or d_len + s_len > self.deepl_max_chars:
+                    deepl_b.append(curr_d)
+                    curr_d, d_len = [], 0
+                curr_d.append(s)
+                d_len += s_len
+            elif s_len <= 800:
+                if len(curr_g) >= 10 or g_len + s_len > 3000:
+                    google_b.append(curr_g)
+                    curr_g, g_len = [], 0
+                curr_g.append(s)
+                g_len += s_len
+            else:
+                if len(curr_gpt) >= 5 or gpt_len + s_len > 7000:
+                    gpt_b.append(curr_gpt)
+                    curr_gpt, gpt_len = [], 0
+                curr_gpt.append(s)
+                gpt_len += s_len
+        for c, out in ((curr_d, deepl_b), (curr_g, google_b), (curr_gpt, gpt_b)):
+            if c:
+                out.append(c)
+        return deepl_b, google_b, gpt_b
+
+    def safe_json_extract_v2(self, text):
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            self.logger.warning("GPT malformed JSON: trying envelope extraction")
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    data = json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    self.logger.error("GPT malformed JSON: envelope extraction failed")
+                    return []
+            else:
+                self.logger.error("GPT malformed JSON: no object found")
+                return []
+        vals = data.get("translations") if isinstance(data, dict) else None
+        return vals if isinstance(vals, list) else []
+
+    def request_gpt_batch(self, batch, depth=0):
+        if self.stop_event.is_set() or not self.gpt_client:
+            return [None] * len(batch)
+        batch_hash = hashlib.md5(json.dumps(batch, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if batch_hash in self.gpt_request_history:
+            return [None] * len(batch)
+        if self.gpt_circuit_breaker_until > time.time():
+            self.logger.warning("GPT cooldown active, batch skipped")
+            return [None] * len(batch)
+
+        model_name = {"Cheap": "gpt-4o-mini", "Balanced": "gpt-4.1-mini", "Quality": "gpt-4.1"}.get(self.gpt_mode_combo.get(), "gpt-4o-mini")
+        request_payload = json.dumps({"texts": batch}, ensure_ascii=False)
+
+        for attempt in range(3):
+            try:
+                time.sleep(self.gpt_delay)
+                response = self.gpt_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "Return strict JSON object with exactly one key 'translations' as array of same length and order. No markdown, no explanation."},
+                        {"role": "user", "content": request_payload},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    timeout=45,
+                )
+                parsed = self.safe_json_extract_v2(response.choices[0].message.content)
+                if len(parsed) != len(batch):
+                    self.logger.warning("GPT invalid batch length")
+                    raise ValueError("Invalid GPT batch length")
+
+                out = []
+                for s, t in zip(batch, parsed):
+                    if self.validate_translation(s, t):
+                        out.append(self.normalize_text(t))
+                    else:
+                        self.logger.warning("GPT hallucination/invalid output rejected")
+                        out.append(None)
+
+                if any(out):
+                    self.gpt_request_history.add(batch_hash)
+
+                usage = getattr(response, "usage", None)
+                if usage and model_name in self.pricing:
+                    price = self.pricing[model_name]
+                    c = ((usage.prompt_tokens / 1_000_000) * price["in"]) + ((usage.completion_tokens / 1_000_000) * price["out"])
+                    self.update_stats("cost", c)
+                self.update_stats("gpt", sum(1 for x in out if x))
+                self.gpt_consecutive_failures = 0
+                self.gpt_delay = max(1.0, self.gpt_delay * 0.85)
+                return out
+            except Exception as e:
+                self.gpt_consecutive_failures += 1
+                self.gpt_delay = min(20.0, self.gpt_delay * 1.8)
+                self.logger.warning(f"GPT retry escalation attempt={attempt + 1} delay={self.gpt_delay:.2f}s err={e}")
+                if self.gpt_consecutive_failures >= 6:
+                    self.gpt_circuit_breaker_until = time.time() + 300
+                    self.logger.error("GPT circuit breaker activation: cooldown 300s")
+                    break
+
+        if len(batch) > 1 and depth < 2:
+            self.logger.warning("GPT split recursion activated")
+            mid = len(batch) // 2
+            left = self.request_gpt_batch(batch[:mid], depth + 1)
+            right = self.request_gpt_batch(batch[mid:], depth + 1)
+            return left + right
+        return [None] * len(batch)
+
+    def request_deepl_batch(self, batch, depth=0):
+        if self.stop_event.is_set():
+            return [None] * len(batch)
+        if not batch:
+            return []
+        if self.deepl_disabled_until > time.time():
+            return [None] * len(batch)
+
+        key = self.api_entry.get().strip()
+        if not key:
+            return [None] * len(batch)
+
+        if sum(len(s) for s in batch) > 6000 and len(batch) > 1:
+            mid = len(batch) // 2
+            return self.request_deepl_batch(batch[:mid], depth + 1) + self.request_deepl_batch(batch[mid:], depth + 1)
+
+        url = "https://api-free.deepl.com/v2/translate"
+        data = [("text", s) for s in batch]
+        data.extend([
+            ("target_lang", self.target_lang.get().strip().upper() or "RU"),
+            ("tag_handling", "xml"),
+        ])
+        headers = {"Authorization": f"DeepL-Auth-Key {key}"}
+
+        for attempt in range(4):
+            if self.stop_event.is_set():
+                return [None] * len(batch)
+            try:
+                time.sleep(self.current_delay + random.uniform(0, 0.2))
+                resp = self.session.post(url, data=data, headers=headers, timeout=35)
+                sc = resp.status_code
+                if sc == 200:
+                    body = resp.json()
+                    tr = [x.get("text", "") for x in body.get("translations", [])]
+                    if len(tr) != len(batch):
+                        raise ValueError("DeepL batch size mismatch")
+                    out = [self.normalize_text(t) if self.validate_translation(s, t) else None for s, t in zip(batch, tr)]
+                    self.update_stats("deepl", sum(1 for x in out if x))
+                    self.current_delay = max(0.2, self.current_delay * 0.9)
+                    return out
+                if sc in (429, 456):
+                    self.current_delay = min(12.0, self.current_delay * 1.8)
+                    self.deepl_max_chars = max(400, int(self.deepl_max_chars * 0.8))
+                    self.logger.warning(f"DeepL rate-limited ({sc}), delay={self.current_delay:.2f}, max_chars={self.deepl_max_chars}")
+                    continue
+                if sc == 403:
+                    self.deepl_disabled_until = time.time() + 900
+                    self.logger.error("DeepL key forbidden/blocked; disabling DeepL for 15 minutes")
+                    return [None] * len(batch)
+                self.logger.warning(f"DeepL unexpected status={sc}")
+            except Exception as e:
+                self.current_delay = min(12.0, self.current_delay * 1.5)
+                self.logger.warning(f"DeepL request failed attempt={attempt + 1}: {e}")
+
+        if len(batch) > 1 and depth < 2:
+            mid = len(batch) // 2
+            return self.request_deepl_batch(batch[:mid], depth + 1) + self.request_deepl_batch(batch[mid:], depth + 1)
+        return [None] * len(batch)
+
+    def google_fallback(self, batch):
+        if self.stop_event.is_set() or not batch:
+            return [None] * len(batch)
+        lang = self.target_lang.get().strip().lower() or "ru"
+        if lang not in self.google_translators:
+            self.google_translators[lang] = GoogleTranslator(source="auto", target=lang)
+        tr = self.google_translators[lang]
+
+        out = [None] * len(batch)
+        for i, text in enumerate(batch):
+            for attempt in range(3):
+                if self.stop_event.is_set():
+                    return out
+                try:
+                    time.sleep(self.google_delay + random.uniform(0.0, 0.25))
+                    translated = tr.translate(text)
+                    if self.validate_translation(text, translated):
+                        out[i] = self.normalize_text(translated)
+                        self.update_stats("google", 1)
+                        self.google_delay = max(0.4, self.google_delay * 0.92)
+                        break
+                except Exception as e:
+                    self.google_delay = min(6.0, self.google_delay * 1.4)
+                    self.logger.warning(f"Google fallback failed idx={i} attempt={attempt + 1}: {e}")
+            if out[i] is None and self.gpt_enable_var.get() and self.gpt_client:
+                out[i] = self.request_gpt_batch([text])[0]
+        return out
+
+    def _apply_translation(self, orig_batch, trans_batch):
+        if not trans_batch:
+            return
+        new_pairs = {}
+        failed = 0
+        for o, t in zip(orig_batch, trans_batch):
+            no = self.normalize_text(o)
+            if not no:
+                continue
+            if t and self.validate_translation(o, t):
+                new_pairs[no] = self.normalize_text(t)
+            else:
+                failed += 1
+        if new_pairs:
+            with self.cache_lock:
+                self.cache.update(new_pairs)
+        if failed:
+            self.update_stats("failed", failed)
+
+    def translate_stage(self, strings):
+        if not strings:
+            return
+        self.logger.info(f"Translation stage start: {len(strings)} strings")
+
+        d_batches, g_batches, gpt_batches = self.make_smart_batches(strings)
+        total_batches = len(d_batches) + len(g_batches) + len(gpt_batches)
+        processed = 0
+
+        for b in d_batches:
+            if self.stop_event.is_set():
+                break
+            res = self.request_deepl_batch(b)
+            self._apply_translation(b, res)
+            missing = [src for src, dst in zip(b, res) if not dst]
+            if missing:
+                self._apply_translation(missing, self.google_fallback(missing))
+            processed += 1
+            self.update_progress_smart(processed, total_batches)
+
+        for b in g_batches:
+            if self.stop_event.is_set():
+                break
+            res = self.google_fallback(b)
+            self._apply_translation(b, res)
+            missing = [src for src, dst in zip(b, res) if not dst]
+            if missing:
+                self._apply_translation(missing, self.request_gpt_batch(missing))
+            processed += 1
+            self.update_progress_smart(processed, total_batches)
+
+        for b in gpt_batches:
+            if self.stop_event.is_set():
+                break
+            res = self.request_gpt_batch(b)
+            self._apply_translation(b, res)
+            processed += 1
+            self.update_progress_smart(processed, total_batches)
+
+    def write_stage(self, files_to_process):
+        for path in files_to_process:
+            if self.stop_event.is_set():
+                break
+            content, enc = self.read_file_safe(path)
+            if not content:
+                continue
+
+            def repl(match):
+                raw = match.group(1)
+                original = self.normalize_text(bytes(raw, "utf-8").decode("unicode_escape", errors="ignore"))
+                if not original:
+                    return match.group(0)
+                with self.cache_lock:
+                    translated = self.cache.get(original)
+                if not translated:
+                    return match.group(0)
+                escaped = translated.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                return f'"{escaped}"'
+
+            new_content = STRING_PATTERN.sub(repl, content)
+            if new_content == content:
+                continue
+
+            fd, tmp = tempfile.mkstemp(prefix=".tmp_file_", suffix=TMP_SUFFIX, dir=os.path.dirname(path) or ".")
+            try:
+                with os.fdopen(fd, "w", encoding=enc or "utf-8", errors="replace", newline="") as f:
+                    f.write(new_content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                backup = f"{path}.bak"
+                if os.path.exists(path):
+                    shutil.copy2(path, backup)
+                os.replace(tmp, path)
+                with self.state_lock:
+                    self.file_state[path] = self.get_signature(path)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+    def autosave_loop(self):
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(60):
+                break
+            if self.autosave_in_progress:
+                continue
+            with self.save_lock:
+                self.autosave_in_progress = True
+                try:
+                    self.compact_cache()
+                    self.atomic_save_json(CACHE_FILE, self.cache, self.cache_lock)
+                    self.atomic_save_json(STATE_FILE, self.file_state, self.state_lock)
+                    self.export_metrics()
+                    self.logger.info("Autosave completed")
+                except Exception as e:
+                    self.logger.error(f"Autosave failed: {e}")
+                finally:
+                    self.autosave_in_progress = False
+
+    def export_metrics(self):
+        with self.stat_lock:
+            stats = dict(self.stat_data)
+        runtime = max(1.0, time.time() - self.start_ts) if self.start_ts else 0.0
+        total = max(1, stats["total_strings"])
+        translated = stats["deepl"] + stats["google"] + stats["gpt"]
+        metrics = {
+            "total_strings": stats["total_strings"],
+            "cache_hits": stats["cache_hits"],
+            "deepl_success": stats["deepl"],
+            "google_success": stats["google"],
+            "gpt_success": stats["gpt"],
+            "failed": stats["failed"],
+            "estimated_cost": round(stats["cost"], 6),
+            "runtime_sec": round(runtime, 2),
+            "cache_hit_ratio": round(stats["cache_hits"] / total, 4),
+            "fallback_ratio": round((stats["google"] + stats["gpt"]) / max(1, translated), 4),
+        }
+        self.atomic_save_json(METRICS_FILE, metrics, self.save_lock)
+
+    def run_pipeline(self):
+        self.cleanup_temp_files()
+        self.start_ts = time.time()
+        self.is_running = True
+        self.logger.info("Pipeline started")
+
+        all_files = []
+        for root_dir, _, files in os.walk(self.folder):
+            for f in files:
+                if f.endswith((".json", ".snbt")):
+                    all_files.append(os.path.join(root_dir, f))
+
+        strings_buffer = set()
+        files_to_process = []
+        total_files = max(1, len(all_files))
+
+        for i, path in enumerate(all_files, start=1):
+            if self.stop_event.is_set():
+                break
+            while self.pause_requested and not self.stop_event.is_set():
+                time.sleep(0.2)
+
+            sig = self.get_signature(path)
+            with self.state_lock:
+                if self.file_state.get(path) == sig:
+                    self.update_progress_smart(i, total_files)
+                    continue
+
+            content, _ = self.read_file_safe(path)
+            if not content:
+                continue
+
+            files_to_process.append(path)
+            for m in STRING_PATTERN.finditer(content):
+                raw = m.group(1)
+                try:
+                    val = bytes(raw, "utf-8").decode("unicode_escape", errors="ignore")
+                except Exception:
+                    continue
+                val = self.normalize_text(val)
+                if not self.is_translatable(val):
+                    continue
+
+                self.update_stats("total_strings", 1)
+                with self.cache_lock:
+                    if val in self.cache:
+                        self.update_stats("cache_hits", 1)
+                        continue
+                strings_buffer.add(val)
+
+                if len(strings_buffer) >= 3000:
+                    self.translate_stage(list(strings_buffer))
+                    strings_buffer.clear()
+                    self.compact_cache()
+
+            if i % 25 == 0:
+                with self.save_lock:
+                    self.compact_cache()
+                    self.atomic_save_json(CACHE_FILE, self.cache, self.cache_lock)
+                    self.atomic_save_json(STATE_FILE, self.file_state, self.state_lock)
+                    self.export_metrics()
+
+            self.update_progress_smart(i, total_files)
+
+        if strings_buffer and not self.stop_event.is_set():
+            self.translate_stage(list(strings_buffer))
+            strings_buffer.clear()
+
+        if files_to_process and not self.stop_event.is_set():
+            self.write_stage(files_to_process)
+
+        with self.save_lock:
+            self.compact_cache()
+            self.atomic_save_json(CACHE_FILE, self.cache, self.cache_lock)
+            self.atomic_save_json(STATE_FILE, self.file_state, self.state_lock)
+            self.export_metrics()
+
+        self.logger.info("Pipeline finished")
+        self.is_running = False
+        try:
+            self.ui_queue.put_nowait(("reset_controls", None))
+        except queue.Full:
+            pass
+
+    def start_translation(self):
+        if self.is_running:
+            return
+        if not self.folder:
+            self.logger.warning("Select folder first")
+            return
+
+        self.reset_runtime_state()
+        self.stop_event.clear()
+        self.pause_requested = False
+
+        if self.gpt_enable_var.get():
+            key = self.gpt_api_entry.get().strip()
+            if key:
+                self.gpt_client = OpenAI(api_key=key)
+
+        self.start_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL)
+
+        self.auto_save_thread = threading.Thread(target=self.autosave_loop, daemon=True)
+        self.auto_save_thread.start()
+        self.pipeline_thread = threading.Thread(target=self.run_pipeline, daemon=True)
+        self.pipeline_thread.start()
+
     def on_close(self):
         self.stop_event.set()
-        self.atomic_save_json(CACHE_FILE, self.cache, self.cache_lock)
-        self.atomic_save_json(STATE_FILE, self.file_state, self.state_lock)
+        if self.pipeline_thread and self.pipeline_thread.is_alive():
+            self.pipeline_thread.join(timeout=3.0)
+        if self.auto_save_thread and self.auto_save_thread.is_alive():
+            self.auto_save_thread.join(timeout=3.0)
+
+        with self.save_lock:
+            self.compact_cache()
+            self.atomic_save_json(CACHE_FILE, self.cache, self.cache_lock)
+            self.atomic_save_json(STATE_FILE, self.file_state, self.state_lock)
+            self.export_metrics()
         self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = QuestTranslatorEngine(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
